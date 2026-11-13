@@ -135,7 +135,7 @@ details.recs > .list { margin-top: 10px; }
   <main class="view" id="view-capture">
     <section class="sec">
       <div class="panel capture stack">
-        <textarea id="in-text" aria-label="會議內容或項目說明" placeholder="說出或貼上會議內容，按「歸檔」就好。&#10;AI 會判斷它屬於哪個項目、整理摘要並列出後續待辦。&#10;&#10;也可以直接描述一個項目，例如：「新增項目『官網改版』，意義是把官網轉換率從 2% 拉到 4%。」"></textarea>
+        <textarea id="in-text" aria-label="會議內容或項目說明" placeholder="說出或貼上會議內容，或貼上 Google 文件／試算表／簡報的連結，按「歸檔」就好。&#10;AI 會讀取內容、判斷它屬於哪個項目、整理摘要並列出後續待辦。&#10;&#10;也可以直接描述一個項目，例如：「新增項目『官網改版』，意義是把官網轉換率從 2% 拉到 4%。」"></textarea>
         <p class="partial" id="in-partial" aria-live="polite"></p>
         <div class="row">
           <button class="btn primary big" id="in-go">歸檔</button>
@@ -228,7 +228,7 @@ details.recs > .list { margin-top: 10px; }
   var TYPE = { meeting: "會議", interview: "面談" };
   var SLOTS = [["morning", "早報"], ["noon", "午報"], ["evening", "晚報"]];
 
-  var db = null, sample = null, dict = null;
+  var db = null, sample = null, dict = null, mcp = null;
   var S = { projects: [], records: [], followups: [], briefs: [], loaded: { projects: false, records: false, followups: false, briefs: false } };
   var ui = { briefEdit: {}, briefDraft: {}, confirm: null, open: {}, result: null, busy: false };
 
@@ -503,30 +503,78 @@ details.recs > .list { margin-top: 10px; }
     }
     return chain.then(function () { return { notes: notes, recId: recId }; });
   }
+  /* ---------- Google links ---------- */
+  var DRIVE = "Google Drive";
+  var LINK_RE = /https?:\/\/(?:docs|drive)\.google\.com\/[^\s<>"'）)】」]+/g;
+  var OTHER_RE = /https?:\/\/(?:chat|mail|meet|calendar)\.google\.com\/[^\s<>"'）)】」]+/g;
+  var MCP_ERR = { needs_reauth: "Google Drive 連線已過期，請到 claude.ai 設定 → 連接器重新連結。",
+    server_not_connected: "尚未連結 Google Drive，請到 claude.ai 設定 → 連接器加入。", selection_required: "請先在 claude.ai 選擇要使用的 Google Drive 連接器。",
+    not_in_manifest: "這個頁面未獲允許讀取 Google Drive。", approval_required: "讀取 Google Drive 需要您的允許。", not_granted: "這個頁面未獲允許讀取 Google Drive。",
+    blocked_by_policy: "組織政策不允許這個頁面讀取 Google Drive。", tool_error: "讀不到這個檔案（可能沒有權限，或連結有誤）。" };
+  function fileIdOf(url) {
+    var m = url.match(/\/d\/([A-Za-z0-9_-]{10,})/) || url.match(/[?&]id=([A-Za-z0-9_-]{10,})/) || url.match(/\/folders\/([A-Za-z0-9_-]{10,})/);
+    return m && url.indexOf("/folders/") < 0 ? m[1] : null;
+  }
+  function payloadText(res) {
+    var p = res && res.payload, keys = ["content", "text", "fileContent", "body", "markdown"], i;
+    if (typeof p === "string") return p;
+    if (p && typeof p === "object") {
+      for (i = 0; i < keys.length; i++) if (typeof p[keys[i]] === "string" && p[keys[i]]) return p[keys[i]];
+      try { return JSON.stringify(p); } catch (e) {}
+    }
+    return ((res && res.content) || []).filter(function (b) { return b && b.type === "text"; }).map(function (b) { return b.text; }).join("\n");
+  }
+  function readLinks(text) {
+    var urls = (text.match(LINK_RE) || []), ids = [], out = { docs: [], warns: [], found: 0 };
+    urls.forEach(function (u) { var id = fileIdOf(u); if (id && ids.indexOf(id) < 0) ids.push(id); });
+    if ((text.match(OTHER_RE) || []).length) out.warns.push("Google Chat、Gmail、Meet、日曆的連結目前無法自動讀取，請直接把內容貼上來。");
+    if (ids.length > 5) { out.warns.push("一次最多讀取 5 個連結，其餘已略過。"); ids = ids.slice(0, 5); }
+    out.found = ids.length;
+    if (!ids.length) return Promise.resolve(out);
+    if (!mcp) { out.warns.push("這個檢視無法讀取 Google 連結，請直接貼上內容。"); return Promise.resolve(out); }
+    return ids.reduce(function (p, id, i) {
+      return p.then(function () {
+        return mcp.callTool(DRIVE, "read_file_content", { fileId: id }).then(function (res) {
+          var t = payloadText(res).trim();
+          if (t) out.docs.push({ id: id, text: t.slice(0, 25000) }); else out.warns.push("第 " + (i + 1) + " 個連結沒有可讀取的文字。");
+        }, function (e) {
+          var msg = MCP_ERR[e && e.code] || "讀取連結失敗，請再試一次。";
+          if (out.warns.indexOf(msg) < 0) out.warns.push(msg);
+        });
+      });
+    }, Promise.resolve()).then(function () { return out; });
+  }
+
   function fileIt() {
     var text = $("in-text").value.trim(), st = $("in-status");
     if (ui.busy) return;
     if (!db) { st.textContent = "目前無法連到資料庫。"; return; }
-    if (!text) { st.textContent = "請先輸入或口述內容。"; return; }
+    if (!text) { st.textContent = "請先輸入、口述，或貼上 Google 文件連結。"; return; }
     if (dict && dict.active()) dict.stop().catch(function () {});
     ui.busy = true; $("in-go").disabled = true;
     var done = function () { ui.busy = false; $("in-go").disabled = false; };
-    if (!sample) {
-      var ref = db.collection("records").doc();
-      ref.set({ projectId: "", type: "meeting", date: today(), title: text.split("\n")[0].slice(0, 30), people: "", summary: "", notes: text.slice(0, 100000), createdAt: Date.now() })
-        .then(function () { $("in-text").value = ""; ui.result = { notes: ["已儲存到「未分類」。這個檢視無法使用 AI，請到「項目」分頁手動選擇項目。"], recId: ref.id }; st.textContent = ""; renderAll(); })
-        .catch(function () { st.textContent = "儲存失敗，請再試一次。"; }).then(done);
-      return;
-    }
-    st.textContent = "AI 歸檔中，約需數十秒…";
-    sample.json(buildPrompt(text), { cache: false }).then(function (out) {
-      return applyResult(out, text).then(function (res) {
-        if (!res.notes.length) { st.textContent = "AI 看不出這是會議內容或項目說明，沒有儲存任何東西。請補充後再試。"; return; }
-        $("in-text").value = ""; st.textContent = "完成。"; ui.result = res; renderAll();
-      }, function () { st.textContent = "寫入資料庫時失敗，內容仍保留在上方，請再按一次歸檔。"; });
-    }, function (e) {
-      st.textContent = (AI_ERR[e && e.code] || "AI 歸檔失敗。") + "內容仍保留在上方。";
-    }).then(done);
+    st.textContent = LINK_RE.test(text) ? "讀取連結中…" : ""; LINK_RE.lastIndex = 0;
+    readLinks(text).then(function (lr) {
+      var own = text.replace(LINK_RE, "").replace(OTHER_RE, "").trim();
+      if (!lr.docs.length && own.length < 10 && lr.warns.length) { st.textContent = lr.warns.join(" ") + "沒有儲存任何東西。"; return; }
+      var full = text + lr.docs.map(function (d, i) { return "\n\n【連結 " + (i + 1) + " 的文件內容】\n" + d.text; }).join("");
+      var finish = function (res) { res.notes = lr.warns.concat(res.notes); $("in-text").value = ""; st.textContent = "完成。"; ui.result = res; renderAll(); };
+      if (!sample) {
+        var ref = db.collection("records").doc();
+        return ref.set({ projectId: "", type: "meeting", date: today(), title: text.split("\n")[0].slice(0, 30), people: "", summary: "", notes: full.slice(0, 100000), createdAt: Date.now() })
+          .then(function () { finish({ notes: ["已儲存到「未分類」。這個檢視無法使用 AI，請到「項目」分頁手動選擇項目。"], recId: ref.id }); },
+                function () { st.textContent = "儲存失敗，請再試一次。"; });
+      }
+      st.textContent = "AI 歸檔中，約需數十秒…";
+      return sample.json(buildPrompt(full), { cache: false }).then(function (out) {
+        return applyResult(out, full).then(function (res) {
+          if (!res.notes.length) { st.textContent = "AI 看不出這是會議內容或項目說明，沒有儲存任何東西。請補充後再試。"; return; }
+          finish(res);
+        }, function () { st.textContent = "寫入資料庫時失敗，內容仍保留在上方，請再按一次歸檔。"; });
+      }, function (e) {
+        st.textContent = (AI_ERR[e && e.code] || "AI 歸檔失敗。") + "內容仍保留在上方。";
+      });
+    }).then(done, done);
   }
 
   /* ---------- dictation ---------- */
@@ -581,6 +629,7 @@ details.recs > .list { margin-top: 10px; }
   function boot() {
     if (!window.claude || !window.claude.use) { banner("請在 claude.ai 開啟這個頁面，才能讀寫資料。"); return; }
     window.claude.use("dictation").then(function (d) { if (d) { dict = d; setupDictation(); } });
+    window.claude.use("mcp").then(function (m) { mcp = m; });
     Promise.all([window.claude.use("db"), window.claude.use("sample")]).then(function (caps) {
       db = caps[0]; sample = caps[1];
       if (!sample) { $("in-go").textContent = "儲存"; $("in-status").textContent = "這個檢視無法使用 AI 自動歸類，內容會先存到「未分類」。"; }
